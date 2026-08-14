@@ -117,6 +117,7 @@ class Maquina(ap.Agent):
         self.carga = 0
         self.distancia = 0
         self.giros = 0
+        self.recargas = 0
 
     @property
     def ubicacion(self):
@@ -138,6 +139,13 @@ class Maquina(ap.Agent):
 
     def reanudar(self):
         self.detenido = False
+
+    def necesitaGasolina(self):
+        return self.gasolina <= self.gasolina_max * self.p.umbral_gasolina
+
+    def cargarGasolina(self):
+        self.gasolina = self.gasolina_max
+        self.recargas += 1
 
     def moverse(self):
         """Avanza hasta `velocidad` celdas por paso. Devuelve las celdas recorridas."""
@@ -179,16 +187,30 @@ class Harvester(Maquina):
         self.estado = 'operando'
         self.objetivo = None
         self.tractor_asignado = None
+        self.zona = None
+
+    def autoasignarZona(self):
+        """Cada harvester reparte las columnas del campo entre si mismo y sus
+        hermanos (segun su posicion de arranque) para no pisarse el trabajo."""
+        hermanos = sorted(self.model.harvesters, key=lambda h: h.ubicacion[1])
+        indice = hermanos.index(self)
+        columnas = self.model.campo.shape[1]
+        ancho = columnas / len(hermanos)
+        self.zona = (int(indice * ancho), int((indice + 1) * ancho))
 
     def buscar_objetivo(self):
-        listas = [c for c in self.model.campo.celdas_listas()
+        libres = [c for c in self.model.campo.celdas_listas()
                   if c not in self.model.reservadas]
-        if not listas:
+        if not libres:
             self.objetivo = None
             return False
+
+        propias = [c for c in libres if self.zona[0] <= c[1] < self.zona[1]]
+        candidatas = propias if propias else libres  # si termino su zona, ayuda en otras
+
         aqui = self.ubicacion
-        listas.sort(key=lambda c: abs(c[0] - aqui[0]) + abs(c[1] - aqui[1]))
-        for candidata in listas[:20]:
+        candidatas.sort(key=lambda c: abs(c[0] - aqui[0]) + abs(c[1] - aqui[1]))
+        for candidata in candidatas[:20]:
             if self.definirRuta(candidata):
                 self.model.reservadas.discard(self.objetivo)
                 self.objetivo = candidata
@@ -234,10 +256,28 @@ class Harvester(Maquina):
                     self.pararVertimiento()
             return
 
+        if self.estado == 'recargando':
+            if self.ubicacion == self.model.base:
+                self.cargarGasolina()
+                self.estado = 'operando'
+            else:
+                if not self.ruta:
+                    self.definirRuta(self.model.base)
+                self.moverse()
+            return
+
         if self.carga >= self.capacidad:
             self.detenerse()
             self.estado = 'esperando_tractor'
             self.llamarTractor()
+            return
+
+        if self.estado == 'operando' and self.necesitaGasolina():
+            if self.objetivo is not None:
+                self.model.reservadas.discard(self.objetivo)
+                self.objetivo = None
+            self.estado = 'recargando'
+            self.ruta = []
             return
 
         if not self.ruta:
@@ -253,7 +293,8 @@ class Harvester(Maquina):
 
 
 class Tractor(Maquina):
-    """Contenedor movil: acude al harvester que lo llama y lleva el grano al silo."""
+    """Contenedor movil: sigue a un harvester mientras cosecha, acude a su
+    llamada al llenarse, le recibe la carga y la lleva al silo."""
 
     def setup(self):
         super().setup()
@@ -264,6 +305,7 @@ class Tractor(Maquina):
         self.consumo = self.p.consumo_tractor
         self.estado = 'libre'
         self.cliente = None
+        self.harvester_seguido = None
 
     def asignar(self, harvester):
         self.cliente = harvester
@@ -279,6 +321,13 @@ class Tractor(Maquina):
         a, b = self.ubicacion, otro.ubicacion
         return abs(a[0] - b[0]) + abs(a[1] - b[1]) <= 1
 
+    def _ir_hacia(self, destino):
+        """Se mueve hacia `destino`, recalculando la ruta si el objetivo cambio."""
+        self.reanudar()
+        if not self.ruta or self.ruta[-1] != destino:
+            self.definirRuta(destino)
+        self.moverse()
+
     def step(self):
         if self.gasolina <= 0:
             self.estado = 'sin_gasolina'
@@ -288,15 +337,21 @@ class Tractor(Maquina):
             self.cliente = None
             self.estado = 'al_silo'
 
+        if self.estado == 'recargando':
+            if self.ubicacion == self.model.base:
+                self.cargarGasolina()
+                self.estado = 'libre'
+            else:
+                self._ir_hacia(self.model.base)
+            return
+
         if self.estado == 'al_silo':
             if self.ubicacion == self.model.silo:
                 self.model.entregado += self.carga
                 self.carga = 0
                 self.estado = 'libre'
             else:
-                if not self.ruta:
-                    self.definirRuta(self.model.silo)
-                self.moverse()
+                self._ir_hacia(self.model.silo)
             return
 
         if self.estado == 'en_camino':
@@ -310,10 +365,7 @@ class Tractor(Maquina):
                 harvester.estado = 'vertiendo'
                 harvester.tractor_asignado = self
             else:
-                self.reanudar()
-                if not self.ruta:
-                    self.definirRuta(harvester.ubicacion)
-                self.moverse()
+                self._ir_hacia(harvester.ubicacion)
             return
 
         if self.estado == 'descargando':
@@ -322,8 +374,31 @@ class Tractor(Maquina):
                 self.liberar()
             return
 
-        if self.estado == 'libre' and self.carga > 0 and self.ubicacion != self.model.silo:
+        # estado 'libre' o 'escoltando': sin carga y sin llamada activa
+        if self.carga > 0 and self.ubicacion != self.model.silo:
             self.estado = 'al_silo'
+            return
+
+        if self.necesitaGasolina():
+            self.estado = 'recargando'
+            self.ruta = []
+            return
+
+        self.seguirHarvester()
+
+    def seguirHarvester(self):
+        """Se acerca al harvester asignado para estar listo cuando llame."""
+        objetivo = self.harvester_seguido
+        if objetivo is None or objetivo not in self.model.harvesters or objetivo.estado == 'sin_gasolina':
+            self.estado = 'libre'
+            self.detenerse()
+            return
+
+        if self.adyacente_a(objetivo):
+            self.detenerse()
+        else:
+            self._ir_hacia(objetivo.ubicacion)
+        self.estado = 'escoltando'
 
 
 class GranjaModel(ap.Model):
@@ -336,6 +411,7 @@ class GranjaModel(ap.Model):
 
         w = self.p.ancho_camino
         self.silo = (w // 2, w // 2)
+        self.base = self.silo  # silo y gasolinera comparten ubicacion
         self.reservadas = set()
         self.cosechado = 0
         self.transferido = 0
@@ -353,13 +429,20 @@ class GranjaModel(ap.Model):
         self.campo.add_agents(self.harvesters, arranques[:len(self.harvesters)])
         self.campo.add_agents(self.tractores, arranques[len(self.harvesters):])
 
+        for harvester in self.harvesters:
+            harvester.autoasignarZona()
+
+        for i, tractor in enumerate(self.tractores):
+            tractor.harvester_seguido = self.harvesters[i % len(self.harvesters)]
+
     def celdas_ocupadas(self, excepto=None):
         return {pos for agente, pos in self.campo.positions.items() if agente is not excepto}
 
     def solicitar_tractor(self, harvester):
         """Asignacion por cercania: el tractor libre mas proximo atiende la llamada."""
         libres = [t for t in self.tractores
-                  if t.estado == 'libre' and t.carga < t.capacidad and t.gasolina > 0]
+                  if t.estado in ('libre', 'escoltando')
+                  and t.carga < t.capacidad and t.gasolina > 0]
         if not libres:
             return None
         aqui = harvester.ubicacion
@@ -393,6 +476,8 @@ class GranjaModel(ap.Model):
                           + sum(t.gasolina_max - t.gasolina for t in self.tractores)))
         self.report('giros_totales', int(sum(self.harvesters.giros)
                                          + sum(self.tractores.giros)))
+        self.report('recargas_totales', int(sum(self.harvesters.recargas)
+                                            + sum(self.tractores.recargas)))
 
 
 PARAMETROS = {
@@ -411,6 +496,7 @@ PARAMETROS = {
     'gasolina_tractor': 1500,
     'consumo_tractor': 0.7,
     'tasa_vertido': 8,
+    'umbral_gasolina': 0.2,
     'seed': 1,
     'steps': 1200,
 }
