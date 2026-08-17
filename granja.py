@@ -19,7 +19,7 @@ OESTE = (0, -1)
 DIRECCIONES = (NORTE, SUR, ESTE, OESTE)
 
 
-def a_estrella(terreno, inicio, meta, bloqueadas=frozenset()):
+def a_estrella(terreno, inicio, meta, bloqueadas=frozenset(), transitables=TRANSITABLE):
     """Ruta de menor costo entre dos celdas evitando obstaculos. Devuelve [] si no hay."""
     if inicio == meta:
         return []
@@ -50,7 +50,7 @@ def a_estrella(terreno, inicio, meta, bloqueadas=frozenset()):
             vecino = (actual[0] + df, actual[1] + dc)
             if not (0 <= vecino[0] < filas and 0 <= vecino[1] < columnas):
                 continue
-            if terreno[vecino] == OBSTACULO:
+            if terreno[vecino] not in transitables:
                 continue
             if vecino in bloqueadas and vecino != meta:
                 continue
@@ -61,6 +61,30 @@ def a_estrella(terreno, inicio, meta, bloqueadas=frozenset()):
                 heapq.heappush(abiertos, (nuevo_g + h(vecino), nuevo_g, vecino))
 
     return []
+
+
+def particionar_rectangulos(filas, columnas, n):
+    """Divide el campo en `n` bloques rectangulares lo mas compactos posible,
+    biseccionando recursivamente el bloque de mayor area por su lado mas
+    largo (particion tipo guillotina). Da areas mas grandes y contiguas que
+    repartir en simples franjas de columnas."""
+    rects = [(0, filas, 0, columnas)]
+    while len(rects) < n:
+        rects.sort(key=lambda r: (r[1] - r[0]) * (r[3] - r[2]), reverse=True)
+        r0, r1, c0, c1 = rects.pop(0)
+        alto, ancho = r1 - r0, c1 - c0
+        if alto >= ancho and alto > 1:
+            corte = r0 + alto // 2
+            rects.append((r0, corte, c0, c1))
+            rects.append((corte, r1, c0, c1))
+        elif ancho > 1:
+            corte = c0 + ancho // 2
+            rects.append((r0, r1, c0, corte))
+            rects.append((r0, r1, corte, c1))
+        else:
+            rects.append((r0, r1, c0, c1))
+            break
+    return rects
 
 
 class Campo(ap.Grid):
@@ -90,6 +114,7 @@ class Campo(ap.Grid):
             self.terreno[f, c] = OBSTACULO
 
         self.total_cultivo = int((self.terreno == LISTO).sum())
+        self.celdas_camino = [tuple(p) for p in np.argwhere(self.terreno == CAMINO)]
 
     def cosechar(self, pos):
         if self.terreno[pos] == LISTO:
@@ -99,6 +124,11 @@ class Campo(ap.Grid):
 
     def celdas_listas(self):
         return [tuple(p) for p in np.argwhere(self.terreno == LISTO)]
+
+    def camino_cercano(self, pos):
+        """Celda de camino mas cercana (distancia Manhattan) a `pos`."""
+        return min(self.celdas_camino,
+                   key=lambda c: abs(c[0] - pos[0]) + abs(c[1] - pos[1]))
 
 
 class Maquina(ap.Agent):
@@ -123,9 +153,9 @@ class Maquina(ap.Agent):
     def ubicacion(self):
         return self.model.campo.positions[self]
 
-    def definirRuta(self, meta, evitar_agentes=True):
+    def definirRuta(self, meta, evitar_agentes=True, transitables=TRANSITABLE):
         bloqueadas = self.model.celdas_ocupadas(excepto=self) if evitar_agentes else frozenset()
-        self.ruta = a_estrella(self.model.campo.terreno, self.ubicacion, meta, bloqueadas)
+        self.ruta = a_estrella(self.model.campo.terreno, self.ubicacion, meta, bloqueadas, transitables)
         return bool(self.ruta)
 
     def girar(self, nueva_direccion):
@@ -189,14 +219,33 @@ class Harvester(Maquina):
         self.tractor_asignado = None
         self.zona = None
 
-    def autoasignarZona(self):
-        """Cada harvester reparte las columnas del campo entre si mismo y sus
-        hermanos (segun su posicion de arranque) para no pisarse el trabajo."""
-        hermanos = sorted(self.model.harvesters, key=lambda h: h.ubicacion[1])
-        indice = hermanos.index(self)
-        columnas = self.model.campo.shape[1]
-        ancho = columnas / len(hermanos)
-        self.zona = (int(indice * ancho), int((indice + 1) * ancho))
+    def _zona_tiene_cultivo(self, zona):
+        r0, r1, c0, c1 = zona
+        return bool((self.model.campo.terreno[r0:r1, c0:c1] == LISTO).any())
+
+    def reclamarZona(self):
+        """Cuando ya no le queda cultivo en su zona, reclama la zona libre (sin
+        dueno activo) mas cercana que aun tenga cultivo, para no invadir la
+        zona de un hermano que sigue trabajando ahi."""
+        disponibles = [i for i, dueno in enumerate(self.model.propietario_zona)
+                       if dueno in (None, self) and self._zona_tiene_cultivo(self.model.zonas[i])]
+        if not disponibles:
+            return False
+
+        aqui = self.ubicacion
+
+        def distancia(i):
+            r0, r1, c0, c1 = self.model.zonas[i]
+            return abs((r0 + r1) / 2 - aqui[0]) + abs((c0 + c1) / 2 - aqui[1])
+
+        elegida = min(disponibles, key=distancia)
+        if self.zona in self.model.zonas:
+            idx_actual = self.model.zonas.index(self.zona)
+            if self.model.propietario_zona[idx_actual] is self:
+                self.model.propietario_zona[idx_actual] = None
+        self.model.propietario_zona[elegida] = self
+        self.zona = self.model.zonas[elegida]
+        return True
 
     def buscar_objetivo(self):
         libres = [c for c in self.model.campo.celdas_listas()
@@ -205,11 +254,21 @@ class Harvester(Maquina):
             self.objetivo = None
             return False
 
-        propias = [c for c in libres if self.zona[0] <= c[1] < self.zona[1]]
-        candidatas = propias if propias else libres  # si termino su zona, ayuda en otras
+        r0, r1, c0, c1 = self.zona
+        propias = [c for c in libres if r0 <= c[0] < r1 and c0 <= c[1] < c1]
 
-        aqui = self.ubicacion
-        candidatas.sort(key=lambda c: abs(c[0] - aqui[0]) + abs(c[1] - aqui[1]))
+        if propias:
+            # barrido en serpentina (fila por fila, alternando sentido) para
+            # cubrir toda la zona sin dejar huecos sueltos que haya que
+            # revisitar despues, pisando cultivo ya cosechado.
+            candidatas = sorted(propias, key=lambda c: (c[0], c[1] if c[0] % 2 == 0 else -c[1]))
+        elif self.reclamarZona():
+            return self.buscar_objetivo()
+        else:
+            # no quedan zonas propias ni reclamables: ayuda donde haga falta
+            aqui = self.ubicacion
+            candidatas = sorted(libres, key=lambda c: abs(c[0] - aqui[0]) + abs(c[1] - aqui[1]))
+
         for candidata in candidatas[:20]:
             if self.definirRuta(candidata):
                 self.model.reservadas.discard(self.objetivo)
@@ -321,11 +380,11 @@ class Tractor(Maquina):
         a, b = self.ubicacion, otro.ubicacion
         return abs(a[0] - b[0]) + abs(a[1] - b[1]) <= 1
 
-    def _ir_hacia(self, destino):
+    def _ir_hacia(self, destino, transitables=TRANSITABLE):
         """Se mueve hacia `destino`, recalculando la ruta si el objetivo cambio."""
         self.reanudar()
         if not self.ruta or self.ruta[-1] != destino:
-            self.definirRuta(destino)
+            self.definirRuta(destino, transitables=transitables)
         self.moverse()
 
     def step(self):
@@ -387,17 +446,20 @@ class Tractor(Maquina):
         self.seguirHarvester()
 
     def seguirHarvester(self):
-        """Se acerca al harvester asignado para estar listo cuando llame."""
+        """Se queda cerca del harvester asignado, pero sin salirse de las
+        casillas de camino, para no meterse a pisar el cultivo mientras
+        espera su llamada."""
         objetivo = self.harvester_seguido
         if objetivo is None or objetivo not in self.model.harvesters or objetivo.estado == 'sin_gasolina':
             self.estado = 'libre'
             self.detenerse()
             return
 
-        if self.adyacente_a(objetivo):
+        punto_espera = self.model.campo.camino_cercano(objetivo.ubicacion)
+        if self.ubicacion == punto_espera or self.adyacente_a(objetivo):
             self.detenerse()
         else:
-            self._ir_hacia(objetivo.ubicacion)
+            self._ir_hacia(punto_espera, transitables=(CAMINO,))
         self.estado = 'escoltando'
 
 
@@ -429,8 +491,20 @@ class GranjaModel(ap.Model):
         self.campo.add_agents(self.harvesters, arranques[:len(self.harvesters)])
         self.campo.add_agents(self.tractores, arranques[len(self.harvesters):])
 
+        self.zonas = particionar_rectangulos(*self.campo.shape, len(self.harvesters))
+        self.propietario_zona = [None] * len(self.zonas)
+        disponibles = list(range(len(self.zonas)))
         for harvester in self.harvesters:
-            harvester.autoasignarZona()
+            aqui = harvester.ubicacion
+
+            def distancia(i, aqui=aqui):
+                r0, r1, c0, c1 = self.zonas[i]
+                return abs((r0 + r1) / 2 - aqui[0]) + abs((c0 + c1) / 2 - aqui[1])
+
+            elegida = min(disponibles, key=distancia)
+            disponibles.remove(elegida)
+            self.propietario_zona[elegida] = harvester
+            harvester.zona = self.zonas[elegida]
 
         for i, tractor in enumerate(self.tractores):
             tractor.harvester_seguido = self.harvesters[i % len(self.harvesters)]
