@@ -238,6 +238,11 @@ class Harvester(Maquina):
         self.objetivo = None
         self.tractor_asignado = None
         self.zona = None
+        self.averiado = False
+        # penaliza (sin prohibir) pisar cultivo ya cosechado en los viajes
+        # de ida/vuelta a la gasolinera: rodea por camino de tierra si el
+        # desvio no sale mucho mas caro que ir en linea recta.
+        self.costos_ruta = {COSECHADO: self.p.get('penalizacion_cosechado_harvester', 3.0)}
 
     def _zona_tiene_libres(self, zona, libres):
         # ojo: cuenta celdas realmente disponibles (sin reservar por otro
@@ -304,8 +309,16 @@ class Harvester(Maquina):
                 aqui = self.ubicacion
                 candidatas = sorted(libres, key=lambda c: abs(c[0] - aqui[0]) + abs(c[1] - aqui[1]))
 
+            # si todavia esta sobre camino de tierra (recien salio de la
+            # gasolinera, por ejemplo) prefiere seguir por camino el mayor
+            # trecho posible en vez de cortar por cultivo ya cosechado; una
+            # vez que pisa cultivo esto deja de tener efecto (no hay camino
+            # cerca para preferir) y vuelve al trayecto directo de siempre.
+            costos = (self.costos_ruta
+                      if self.model.campo.terreno[self.ubicacion] == CAMINO else None)
+
             for candidata in candidatas[:20]:
-                if self.definirRuta(candidata):
+                if self.definirRuta(candidata, costos=costos):
                     self.model.reservadas.discard(self.objetivo)
                     self.objetivo = candidata
                     self.model.reservadas.add(candidata)
@@ -327,9 +340,29 @@ class Harvester(Maquina):
         return transferido
 
     def pararVertimiento(self):
-        self.estado = 'operando'
+        self.estado = 'descompuesto' if self.averiado else 'operando'
         self.tractor_asignado = None
         self.reanudar()
+
+    def _descomponer(self):
+        """Falla mecanica permanente: deja de cosechar y cede su zona para
+        que otro harvester la reclame (mismo mecanismo que usan al terminar
+        una zona: `model.propietario_zona` la deja libre y `reclamarZona`
+        de cualquier hermano la puede tomar). Si ya traia carga a bordo,
+        todavia pide un tractor para no perder ese grano ya cosechado antes
+        de quedar inmovil para siempre."""
+        self.averiado = True
+        self._soltar_objetivo()
+        self.detenerse()
+        if self.zona in self.model.zonas:
+            idx = self.model.zonas.index(self.zona)
+            if self.model.propietario_zona[idx] is self:
+                self.model.propietario_zona[idx] = None
+        if self.carga > 0:
+            self.estado = 'esperando_tractor'
+            self.llamarTractor()
+        else:
+            self.estado = 'descompuesto'
 
     def step(self):
         if self.gasolina <= 0:
@@ -344,6 +377,9 @@ class Harvester(Maquina):
             else:
                 self.estado = 'sin_gasolina'
                 return
+
+        if self.estado == 'descompuesto':
+            return  # averia permanente: ya entrego lo que traia (si tenia), inmovil para siempre
 
         if self.estado == 'esperando_tractor':
             # si nadie estaba libre cuando llamo la primera vez, reintenta
@@ -370,7 +406,7 @@ class Harvester(Maquina):
                 self.estado = 'operando'
             else:
                 if not self.ruta:
-                    self.definirRuta(self.model.base)
+                    self.definirRuta(self.model.base, costos=self.costos_ruta)
                 self.moverse()
             return
 
@@ -384,6 +420,10 @@ class Harvester(Maquina):
             self._soltar_objetivo()
             self.estado = 'recargando'
             self.ruta = []
+            return
+
+        if self.p.prob_descompostura > 0 and self.model.nprandom.random() < self.p.prob_descompostura:
+            self._descomponer()
             return
 
         if not self.ruta:
@@ -437,6 +477,19 @@ class Tractor(Maquina):
             costos = self.costos_ruta
         if not self.ruta or self.ruta[-1] != destino:
             self.definirRuta(destino, transitables=transitables, costos=costos)
+        self.moverse()
+
+    def _acercarse_a(self, harvester):
+        """Se acerca al harvester sin llegar a pisar su celda: la ruta hacia
+        su ubicacion se recorta un paso antes del final, asi queda a
+        distancia 1 (ya vale para `adyacente_a`) en vez de superponerse con
+        el cuando llega a recoger la carga."""
+        destino = harvester.ubicacion
+        self.reanudar()
+        if not self.ruta or self.ruta[-1] != destino:
+            self.definirRuta(destino, costos=self.costos_ruta)
+            if self.ruta and self.ruta[-1] == destino:
+                self.ruta.pop()
         self.moverse()
 
     def step(self):
@@ -505,7 +558,7 @@ class Tractor(Maquina):
                 harvester.estado = 'vertiendo'
                 harvester.tractor_asignado = self
             else:
-                self._ir_hacia(harvester.ubicacion)
+                self._acercarse_a(harvester)
             return
 
         if self.estado == 'descargando':
@@ -683,6 +736,8 @@ PARAMETROS = {
     'tasa_vertido': 8,
     'umbral_gasolina': 0.2,
     'penalizacion_cosechado_tractor': 3.0,
+    'penalizacion_cosechado_harvester': 3.0,
+    'prob_descompostura': 0.0,
     'seed': 1,
     'steps': 1200,
 }
