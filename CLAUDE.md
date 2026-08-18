@@ -19,6 +19,8 @@ No hay `requirements.txt`; dependencias inferidas del entorno: `agentpy`, `numpy
 
 **`Maquina`** (base de `Harvester`/`Tractor`, subclase de `ap.Agent`): gasolina, dirección, ruta A*, conteo de giros/distancia/recargas. `moverse()` avanza hasta `velocidad` celdas/paso; si la siguiente celda de la ruta está ocupada por otro agente, aborta la ruta (replanea el próximo paso) — es el mecanismo anticolisión.
 
+**Ocupación "blanda" para evitar bloqueos mutuos**: `GranjaModel.celdas_ocupadas(..., incluir_parados=False)` deja de contar como obstáculo a un agente **detenido pero con gasolina** (tractor escoltando, harvester esperando su tractor, etc.). Tanto `definirRuta` (planeación) como el sensor de proximidad dentro de `moverse` (chequeo en tiempo real) usan ese mismo criterio — si solo uno de los dos fuera laxo, un agente parado justo en el único acceso a un rincón de cultivo generaría un bloqueo mutuo permanente (el que planea encuentra ruta pero el sensor la tumba cada vez, sin que nadie avance). Un agente con `gasolina <= 0` sí sigue contando siempre como obstáculo duro.
+
 **`Harvester`**: máquina de estados (`operando`, `esperando_tractor`, `vertiendo`, `recargando`, `sin_gasolina`).
 - Zonas: `GranjaModel.setup` particiona el campo en `n_harvesters` rectángulos compactos (`particionar_rectangulos`, bisección tipo guillotina — bloques grandes y contiguos, no franjas de columnas) y asigna cada uno al harvester más cercano (`model.zonas` + `model.propietario_zona`).
 - `buscar_objetivo()`: dentro de su zona, recorre en **serpentina** (fila por fila, alternando sentido) las celdas `LISTO` no reservadas, para cubrir toda la zona sin dejar huecos sueltos que obliguen a volver después pisando cultivo ya cosechado. `model.reservadas` sigue siendo compartido entre todos.
@@ -29,10 +31,17 @@ No hay `requirements.txt`; dependencias inferidas del entorno: `agentpy`, `numpy
 **`Tractor`**: máquina de estados (`libre`, `escoltando`, `en_camino`, `descargando`, `al_silo`, `recargando`, `sin_gasolina`).
 - Cuando está libre, `seguirHarvester()` lo acerca al harvester asignado (`harvester_seguido`) pero **sin salirse de las casillas de camino**: calcula la celda de camino más cercana a la posición del harvester (`Campo.camino_cercano`) y solo se mueve por camino (`definirRuta(..., transitables=(CAMINO,))`), nunca pisa cultivo mientras espera.
 - Al ser llamado (`en_camino`), sí puede atravesar cultivo para llegar hasta el harvester (necesario, ya que el harvester está en pleno campo); descarga (`descargando`), y si se llena o el harvester termina, va a `model.silo` a entregar (`entregado`).
+- En todo desplazamiento con terreno completo (recargar, ir al silo, ir al harvester que llamó) usa `self.costos_ruta = {COSECHADO: p.penalizacion_cosechado_tractor}` para que A* prefiera rodear por camino en vez de cruzar cultivo ya cosechado, siempre que el rodeo no salga desproporcionadamente más caro que la penalización.
 
-**`GranjaModel`** (`ap.Model`): crea `Campo`, coloca harvesters/tractores en celdas de camino aleatorias, arma `zonas`/`propietario_zona` y asigna parejas harvester↔tractor. `silo` y `base` (gasolinera) comparten ubicación. `solicitar_tractor` asigna el tractor libre más cercano. `step()` corre hasta que `cosechado >= total_cultivo`. `update()`/`end()` registran métricas (`cosechado_pct`, `grano_entregado`, `gasolina_total`, `distancia_total`, `combustible_usado`, `giros_totales`, `recargas_totales`).
+**`GranjaModel`** (`ap.Model`): crea `Campo`, coloca harvesters/tractores en celdas de camino aleatorias, arma `zonas`/`propietario_zona` y asigna parejas harvester↔tractor. `solicitar_tractor` asigna el tractor libre más cercano. `step()` corre hasta que `cosechado >= total_cultivo`. `update()`/`end()` registran métricas (`cosechado_pct`, `grano_entregado`, `gasolina_total`, `distancia_total`, `combustible_usado`, `giros_totales`, `recargas_totales`).
 
-**`a_estrella`** acepta un parámetro `transitables` (por defecto `TRANSITABLE` = camino+listo+cosechado) para restringir una ruta a un subconjunto de terreno, como el camino puro que usa el tractor al escoltar.
+**`model.silo` y `model.base` son celdas de camino distintas y separadas** (fila 0, columnas 0 y `min(3, columnas-1)`) — no comparten ubicación. Motivos, en orden de descubrimiento:
+1. Si comparten una sola celda, un tractor descargando ahí le tapa el paso a los harvesters que solo quieren recargar (y viceversa) — un único punto todo-en-uno se vuelve cuello de botella.
+2. Si quedan a distancia 1 (vecinas), un tractor yendo de silo a base y otro yendo de base a silo al mismo tiempo generan un *swap* irresoluble: cada uno planea el único paso directo hacia la celda que el otro ocupa (la meta siempre está exenta del filtro de celdas bloqueadas en `a_estrella`, así el agente pueda aproximarse a un destino ocupado), el sensor de `moverse` lo rechaza cada tick, y ninguno prueba un rodeo porque el camino directo "existe" sobre el papel. Por eso van separadas por varias celdas, no solo vecinas.
+
+Como consecuencia, la ruta de "gas exactamente 0 justo al llegar" (`Tractor.step`) ya no puede asumir que base y silo son el mismo punto: solo entrega la carga si el tractor quedó exactamente sobre `model.silo`, y solo recarga si está sobre `model.base` o `model.silo` (tratando el área del depósito como una sola zona de rescate aunque sean dos celdas).
+
+**`a_estrella`** acepta `transitables` (por defecto `TRANSITABLE` = camino+listo+cosechado) para restringir una ruta a un subconjunto de terreno (p.ej. el camino puro que usa el tractor al escoltar), y `costos` (dict terreno→costo por celda, default 1) para *penalizar sin prohibir* cierto tipo de terreno — así el tractor puede seguir cruzando cultivo cosechado cuando es indispensable, pero prefiere rodear por camino cuando el desvío no sale mucho más caro.
 
 **`PARAMETROS`**: diccionario con la configuración por defecto (shape 40×40, 3 harvesters, 2 tractores, etc.) — se copia y sobreescribe (`dict(PARAMETROS)`) en el notebook para cada corrida distinta, nunca se muta directamente.
 
@@ -40,7 +49,8 @@ No hay `requirements.txt`; dependencias inferidas del entorno: `agentpy`, `numpy
 
 - Todo el código (nombres de variables, funciones, docstrings, comentarios) está en español. Mantener esa convención al editar `granja.py`.
 - Estados de agentes son strings literales comparados directamente (no Enum) — si se agrega un estado nuevo, actualizar también los diccionarios de color en el notebook (`COLOR_HARVESTER`/`COLOR_TRACTOR`) y cualquier lugar que enumere estados válidos.
-- Las celdas objetivo reservadas (`model.reservadas`) deben liberarse (`discard`) en todo camino que abandone o complete un objetivo — al cosechar, al perder gasolina, al no poder trazar ruta — para no dejar celdas fantasma bloqueadas.
+- Las celdas objetivo reservadas (`model.reservadas`) deben liberarse (`discard`) en todo camino que abandone o complete un objetivo — al cosechar, al perder gasolina, al no poder trazar ruta — para no dejar celdas fantasma bloqueadas. Usar `Harvester._soltar_objetivo()` en vez de `self.objetivo = None` a pelo: hacerlo a pelo fue justo el bug que dejaba una reserva fantasma cuando la única celda de cultivo restante en todo el mapa era el propio objetivo del harvester (nadie más la liberaba nunca).
+- Un agente nunca debe poder quedar `sin_gasolina` de forma permanente por descuido de contabilidad: `Harvester.step`/`Tractor.step` recargan primero si `gasolina <= 0` pero `ubicacion == model.base` (el último tanque puede alcanzar justo para llegar) antes de declarar `sin_gasolina`; `solicitar_tractor` exige `not t.necesitaGasolina()` (no solo `> 0`) para no asignar un tractor casi vacío a un viaje que no puede completar; y `Tractor` en `en_camino` aborta a recargar si `necesitaGasolina()` antes de comprometerse a cruzar el campo.
 - Los notebooks importan el modelo (`from granja import GranjaModel, PARAMETROS`) en vez de duplicar lógica; cambios de comportamiento van en `granja.py`.
 
 ## Verificación de cambios
@@ -55,3 +65,20 @@ print(r.reporters)
 ```
 
 Confirmar que `cosechado_pct` llega a 100 y que no quedan agentes en `sin_gasolina` de forma permanente ni loops de `reservadas` sin liberar.
+
+Cualquier cambio a la lógica de movimiento, zonas o gasolina debe revalidarse con una corrida de muchos seeds (no solo uno), porque los bloqueos mutuos suelen depender del layout aleatorio de obstáculos/posiciones iniciales y no aparecen siempre:
+
+```python
+from granja import GranjaModel, PARAMETROS
+fallos = []
+for seed in range(1, 51):
+    m = GranjaModel(dict(PARAMETROS, shape=(24, 24), steps=1500, seed=seed))
+    r = m.run(display=False)
+    if r.reporters['cosechado_pct'][0] < 100:
+        fallos.append(seed)
+print(fallos)  # debe quedar vacio
+```
+
+Si un seed falla, no asumir que es lento: correr ese mismo seed con `steps` mucho más grande (10-20x) para distinguir "necesitaba más pasos" (el % sigue subiendo) de un bloqueo real (el % y el estado de todos los agentes quedan exactamente congelados de un tick a otro).
+
+**Límite conocido, no arreglado**: el umbral de recarga (`umbral_gasolina`) es una fracción fija del tanque, no una estimación de distancia real a la base. Con tanques muy chicos y radios de operación grandes relativos a ese umbral (p.ej. `gasolina=100`, `umbral=0.3` en un mapa 26×26), un harvester puede cruzar el umbral estando ya más lejos de lo que ese remanente alcanza para volver, y quedar `sin_gasolina` a mitad de camino — no es un bloqueo mutuo, es que el presupuesto de combustible no alcanza físicamente. Mantener `gasolina_max * umbral_gasolina` con margen holgado sobre la distancia máxima esperada desde `model.base`.

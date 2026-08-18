@@ -19,11 +19,21 @@ OESTE = (0, -1)
 DIRECCIONES = (NORTE, SUR, ESTE, OESTE)
 
 
-def a_estrella(terreno, inicio, meta, bloqueadas=frozenset(), transitables=TRANSITABLE):
-    """Ruta de menor costo entre dos celdas evitando obstaculos. Devuelve [] si no hay."""
+def a_estrella(terreno, inicio, meta, bloqueadas=frozenset(), transitables=TRANSITABLE, costos=None):
+    """Ruta de menor costo entre dos celdas evitando obstaculos. Devuelve [] si no hay.
+
+    `costos` permite penalizar (sin prohibir) pisar cierto tipo de terreno,
+    mapeando valor-de-terreno -> costo por celda (default 1 para todos los
+    transitables). Con una penalizacion, A* solo elige esa celda cuando de
+    verdad conviene (rodear por camino le costaria mas que la penalizacion).
+    """
     if inicio == meta:
         return []
     filas, columnas = terreno.shape
+    costos = costos or {}
+
+    def costo_celda(pos):
+        return costos.get(int(terreno[pos]), 1)
 
     def h(p):
         return abs(p[0] - meta[0]) + abs(p[1] - meta[1])
@@ -54,7 +64,7 @@ def a_estrella(terreno, inicio, meta, bloqueadas=frozenset(), transitables=TRANS
                 continue
             if vecino in bloqueadas and vecino != meta:
                 continue
-            nuevo_g = g + 1
+            nuevo_g = g + costo_celda(vecino)
             if nuevo_g < costo.get(vecino, np.inf):
                 costo[vecino] = nuevo_g
                 padre[vecino] = actual
@@ -153,9 +163,14 @@ class Maquina(ap.Agent):
     def ubicacion(self):
         return self.model.campo.positions[self]
 
-    def definirRuta(self, meta, evitar_agentes=True, transitables=TRANSITABLE):
-        bloqueadas = self.model.celdas_ocupadas(excepto=self) if evitar_agentes else frozenset()
-        self.ruta = a_estrella(self.model.campo.terreno, self.ubicacion, meta, bloqueadas, transitables)
+    def definirRuta(self, meta, evitar_agentes=True, transitables=TRANSITABLE, costos=None):
+        # los agentes parados-pero-con-gasolina no cuentan como obstaculo fijo
+        # al planear (ver Modelo.celdas_ocupadas): evita que un tractor
+        # escoltando en un camino angosto bloquee para siempre el unico
+        # acceso a un rincon de cultivo.
+        bloqueadas = (self.model.celdas_ocupadas(excepto=self, incluir_parados=False)
+                      if evitar_agentes else frozenset())
+        self.ruta = a_estrella(self.model.campo.terreno, self.ubicacion, meta, bloqueadas, transitables, costos)
         return bool(self.ruta)
 
     def girar(self, nueva_direccion):
@@ -187,7 +202,12 @@ class Maquina(ap.Agent):
             if not self.ruta:
                 break
             siguiente = self.ruta[0]
-            if siguiente in self.model.celdas_ocupadas(excepto=self):
+            # igual que al planear: un agente parado-pero-con-gasolina no
+            # cuenta como obstaculo. Si contara, cuando la ruta lo atraviesa
+            # (porque definirRuta ya lo ignoro) este chequeo la tumbaria cada
+            # vez sin que nadie avance nunca -- un bloqueo mutuo con el
+            # agente parado, que tampoco tiene motivo para moverse.
+            if siguiente in self.model.celdas_ocupadas(excepto=self, incluir_parados=False):
                 self.ruta = []  # sensor de proximidad: replanear el proximo paso
                 break
             actual = self.ubicacion
@@ -219,16 +239,21 @@ class Harvester(Maquina):
         self.tractor_asignado = None
         self.zona = None
 
-    def _zona_tiene_cultivo(self, zona):
+    def _zona_tiene_libres(self, zona, libres):
+        # ojo: cuenta celdas realmente disponibles (sin reservar por otro
+        # harvester), no solo LISTO en crudo, o reclamarZona() podria creer
+        # reclamable una zona cuyo unico cultivo ya esta tomado por otro y
+        # quedar en un ciclo infinito con buscar_objetivo.
         r0, r1, c0, c1 = zona
-        return bool((self.model.campo.terreno[r0:r1, c0:c1] == LISTO).any())
+        return any(r0 <= f < r1 and c0 <= c < c1 for f, c in libres)
 
-    def reclamarZona(self):
-        """Cuando ya no le queda cultivo en su zona, reclama la zona libre (sin
-        dueno activo) mas cercana que aun tenga cultivo, para no invadir la
-        zona de un hermano que sigue trabajando ahi."""
+    def reclamarZona(self, libres):
+        """Cuando ya no le queda cultivo disponible en su zona, reclama la
+        zona libre (sin dueno activo) mas cercana que aun tenga alguna celda
+        realmente disponible, para no invadir la zona de un hermano que
+        sigue trabajando ahi."""
         disponibles = [i for i, dueno in enumerate(self.model.propietario_zona)
-                       if dueno in (None, self) and self._zona_tiene_cultivo(self.model.zonas[i])]
+                       if dueno in (None, self) and self._zona_tiene_libres(self.model.zonas[i], libres)]
         if not disponibles:
             return False
 
@@ -247,36 +272,46 @@ class Harvester(Maquina):
         self.zona = self.model.zonas[elegida]
         return True
 
-    def buscar_objetivo(self):
-        libres = [c for c in self.model.campo.celdas_listas()
-                  if c not in self.model.reservadas]
-        if not libres:
-            self.objetivo = None
-            return False
-
-        r0, r1, c0, c1 = self.zona
-        propias = [c for c in libres if r0 <= c[0] < r1 and c0 <= c[1] < c1]
-
-        if propias:
-            # barrido en serpentina (fila por fila, alternando sentido) para
-            # cubrir toda la zona sin dejar huecos sueltos que haya que
-            # revisitar despues, pisando cultivo ya cosechado.
-            candidatas = sorted(propias, key=lambda c: (c[0], c[1] if c[0] % 2 == 0 else -c[1]))
-        elif self.reclamarZona():
-            return self.buscar_objetivo()
-        else:
-            # no quedan zonas propias ni reclamables: ayuda donde haga falta
-            aqui = self.ubicacion
-            candidatas = sorted(libres, key=lambda c: abs(c[0] - aqui[0]) + abs(c[1] - aqui[1]))
-
-        for candidata in candidatas[:20]:
-            if self.definirRuta(candidata):
-                self.model.reservadas.discard(self.objetivo)
-                self.objetivo = candidata
-                self.model.reservadas.add(candidata)
-                return True
+    def _soltar_objetivo(self):
+        # si el objetivo pendiente no se va a alcanzar, hay que liberar su
+        # reserva aqui: si no, queda "fantasma" en model.reservadas para
+        # siempre (nadie mas la va a soltar) y esa celda nunca se vuelve a
+        # ofrecer a nadie, aunque siga siendo cultivo real sin cosechar.
+        if self.objetivo is not None:
+            self.model.reservadas.discard(self.objetivo)
         self.objetivo = None
-        return False
+
+    def buscar_objetivo(self):
+        while True:
+            libres = [c for c in self.model.campo.celdas_listas()
+                      if c not in self.model.reservadas]
+            if not libres:
+                self._soltar_objetivo()
+                return False
+
+            r0, r1, c0, c1 = self.zona
+            propias = [c for c in libres if r0 <= c[0] < r1 and c0 <= c[1] < c1]
+
+            if propias:
+                # barrido en serpentina (fila por fila, alternando sentido) para
+                # cubrir toda la zona sin dejar huecos sueltos que haya que
+                # revisitar despues, pisando cultivo ya cosechado.
+                candidatas = sorted(propias, key=lambda c: (c[0], c[1] if c[0] % 2 == 0 else -c[1]))
+            elif self.reclamarZona(libres):
+                continue  # reintenta ya con la zona nueva
+            else:
+                # no quedan zonas propias ni reclamables: ayuda donde haga falta
+                aqui = self.ubicacion
+                candidatas = sorted(libres, key=lambda c: abs(c[0] - aqui[0]) + abs(c[1] - aqui[1]))
+
+            for candidata in candidatas[:20]:
+                if self.definirRuta(candidata):
+                    self.model.reservadas.discard(self.objetivo)
+                    self.objetivo = candidata
+                    self.model.reservadas.add(candidata)
+                    return True
+            self._soltar_objetivo()
+            return False
 
     def llamarTractor(self):
         tractor = self.model.solicitar_tractor(self)
@@ -298,10 +333,24 @@ class Harvester(Maquina):
 
     def step(self):
         if self.gasolina <= 0:
-            self.estado = 'sin_gasolina'
-            return
+            # si justo se quedo sin gasolina al llegar a la base (moverse
+            # gasta el ultimo tanque en el mismo paso que lo deja ahi), hay
+            # que recargarlo aqui: si no, queda sin_gasolina para siempre
+            # parado exactamente sobre la gasolinera, bloqueando a cualquiera
+            # que necesite pasar por esa unica celda.
+            if self.ubicacion == self.model.base:
+                self.cargarGasolina()
+                self.estado = 'operando'
+            else:
+                self.estado = 'sin_gasolina'
+                return
 
         if self.estado == 'esperando_tractor':
+            # si nadie estaba libre cuando llamo la primera vez, reintenta
+            # cada paso: si no, se queda esperando para siempre aunque
+            # despues se libere un tractor justo al lado.
+            if self.tractor_asignado is None:
+                self.llamarTractor()
             return  # inmovil hasta que llegue el tractor
 
         if self.estado == 'vertiendo':
@@ -332,9 +381,7 @@ class Harvester(Maquina):
             return
 
         if self.estado == 'operando' and self.necesitaGasolina():
-            if self.objetivo is not None:
-                self.model.reservadas.discard(self.objetivo)
-                self.objetivo = None
+            self._soltar_objetivo()
             self.estado = 'recargando'
             self.ruta = []
             return
@@ -365,6 +412,9 @@ class Tractor(Maquina):
         self.estado = 'libre'
         self.cliente = None
         self.harvester_seguido = None
+        # penaliza (sin prohibir) pisar cultivo ya cosechado: rodea por
+        # camino cuando el desvio no sale mucho mas caro que ir en linea recta
+        self.costos_ruta = {COSECHADO: self.p.get('penalizacion_cosechado_tractor', 3.0)}
 
     def asignar(self, harvester):
         self.cliente = harvester
@@ -380,17 +430,36 @@ class Tractor(Maquina):
         a, b = self.ubicacion, otro.ubicacion
         return abs(a[0] - b[0]) + abs(a[1] - b[1]) <= 1
 
-    def _ir_hacia(self, destino, transitables=TRANSITABLE):
+    def _ir_hacia(self, destino, transitables=TRANSITABLE, costos=None):
         """Se mueve hacia `destino`, recalculando la ruta si el objetivo cambio."""
         self.reanudar()
+        if costos is None:
+            costos = self.costos_ruta
         if not self.ruta or self.ruta[-1] != destino:
-            self.definirRuta(destino, transitables=transitables)
+            self.definirRuta(destino, transitables=transitables, costos=costos)
         self.moverse()
 
     def step(self):
         if self.gasolina <= 0:
-            self.estado = 'sin_gasolina'
-            return
+            # mismo caso que en Harvester: si el ultimo tanque alcanzo justo
+            # para llegar al deposito, recargar aqui en vez de quedar
+            # sin_gasolina parado para siempre sobre una celda que ademas es
+            # de paso obligado para otros (silo o base). Silo y base son
+            # celdas vecinas pero distintas: solo entrega grano si de
+            # casualidad quedo tirado justo sobre el silo.
+            if self.ubicacion == self.model.silo and self.carga > 0:
+                self.model.entregado += self.carga
+                self.carga = 0
+            if self.ubicacion in (self.model.base, self.model.silo):
+                self.cargarGasolina()
+                if self.cliente is not None:
+                    if self.cliente.tractor_asignado is self:
+                        self.cliente.tractor_asignado = None
+                    self.cliente = None
+                self.estado = 'libre'
+            else:
+                self.estado = 'sin_gasolina'
+                return
 
         if self.carga >= self.capacidad and self.estado != 'descargando':
             self.cliente = None
@@ -417,6 +486,18 @@ class Tractor(Maquina):
             harvester = self.cliente
             if harvester is None:
                 self.estado = 'libre'
+                return
+            if self.necesitaGasolina():
+                # todavia no recogio carga: mejor abortar e ir a recargar que
+                # arriesgarse a quedar varado a mitad de camino sin poder
+                # llegar ni de vuelta a la base. El harvester vuelve a pedir
+                # tractor (Harvester.step reintenta cuando tractor_asignado
+                # queda en None).
+                if harvester.tractor_asignado is self:
+                    harvester.tractor_asignado = None
+                self.cliente = None
+                self.estado = 'recargando'
+                self.ruta = []
                 return
             if self.adyacente_a(harvester):
                 self.detenerse()
@@ -471,9 +552,19 @@ class GranjaModel(ap.Model):
                            ancho_camino=self.p.ancho_camino,
                            pct_obstaculos=self.p.pct_obstaculos)
 
-        w = self.p.ancho_camino
-        self.silo = (w // 2, w // 2)
-        self.base = self.silo  # silo y gasolinera comparten ubicacion
+        # silo (entrega de grano) y base (gasolinera) en celdas de camino
+        # distintas: si comparten una sola celda, un tractor descargando ahi
+        # le tapa el paso a los harvesters que solo quieren recargar (y
+        # viceversa). Van separadas por varias celdas (no solo vecinas): si
+        # quedan a distancia 1, un tractor yendo de silo a base y otro yendo
+        # de base a silo al mismo tiempo generan un swap imposible de
+        # resolver (cada uno planea el unico paso directo hacia la celda
+        # que el otro ocupa, el sensor lo rechaza cada vez, y ninguno prueba
+        # un rodeo porque el camino directo "existe" sobre el papel). La
+        # fila 0 siempre es camino perimetral completo sin importar
+        # `ancho_camino`, asi que estas celdas estan garantizadas transitables.
+        self.silo = (0, 0)
+        self.base = (0, min(3, self.campo.shape[1] - 1))
         self.reservadas = set()
         self.cosechado = 0
         self.transferido = 0
@@ -509,14 +600,34 @@ class GranjaModel(ap.Model):
         for i, tractor in enumerate(self.tractores):
             tractor.harvester_seguido = self.harvesters[i % len(self.harvesters)]
 
-    def celdas_ocupadas(self, excepto=None):
-        return {pos for agente, pos in self.campo.positions.items() if agente is not excepto}
+    def celdas_ocupadas(self, excepto=None, incluir_parados=True):
+        """Celdas con un agente encima. Con `incluir_parados=False` ignora los
+        agentes detenidos-pero-con-gasolina (tractor escoltando, harvester
+        esperando su tractor, etc.): siguen respetandose al mismo tiempo con
+        el sensor de proximidad en `Maquina.moverse`, pero no cuentan como
+        obstaculo fijo al planear toda la ruta, para no generar un bloqueo
+        permanente si uno de ellos queda parado justo en el unico acceso a
+        un rincon de cultivo."""
+        ocupadas = set()
+        for agente, pos in self.campo.positions.items():
+            if agente is excepto:
+                continue
+            if not incluir_parados and agente.detenido and agente.gasolina > 0:
+                continue
+            ocupadas.add(pos)
+        return ocupadas
 
     def solicitar_tractor(self, harvester):
-        """Asignacion por cercania: el tractor libre mas proximo atiende la llamada."""
+        """Asignacion por cercania: el tractor libre mas proximo atiende la llamada.
+
+        Exige gasolina por encima del umbral de recarga (no solo > 0): un
+        tractor casi vacio que aceptara el viaje podria quedarse tirado a
+        mitad de camino sin llegar ni a la cosechadora ni de vuelta a la base.
+        """
         libres = [t for t in self.tractores
                   if t.estado in ('libre', 'escoltando')
-                  and t.carga < t.capacidad and t.gasolina > 0]
+                  and t.carga < t.capacidad
+                  and not t.necesitaGasolina()]
         if not libres:
             return None
         aqui = harvester.ubicacion
@@ -571,6 +682,7 @@ PARAMETROS = {
     'consumo_tractor': 0.7,
     'tasa_vertido': 8,
     'umbral_gasolina': 0.2,
+    'penalizacion_cosechado_tractor': 3.0,
     'seed': 1,
     'steps': 1200,
 }
