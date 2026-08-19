@@ -1,0 +1,7 @@
+agentpy==0.1.5
+numpy==2.5.2
+matplotlib==3.11.1
+pillow==12.3.0
+ipython==9.16.1
+ipykernel==7.3.0
+imageio-ffmpeg==0.6.0

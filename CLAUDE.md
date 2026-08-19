@@ -9,7 +9,7 @@ Simulación multiagente de una cosecha agrícola con [agentpy](https://agentpy.r
 - `GIFS/` — salidas de animación generadas por el notebook.
 - `.venv/` — entorno virtual local (no tocar/versionar).
 
-No hay `requirements.txt`; dependencias inferidas del entorno: `agentpy`, `numpy`, `matplotlib`, `ipython` (para el notebook).
+`requirements.txt` — dependencias fijadas por versión: `agentpy`, `numpy`, `matplotlib`, `pillow`, `ipython`/`ipykernel` (notebook) e `imageio-ffmpeg` (guardar animaciones como video en `granja_v3.ipynb`).
 
 ## Modelo (`granja.py`)
 
