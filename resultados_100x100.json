@@ -1,0 +1,30 @@
+[
+  {
+    "n_harvesters": 1,
+    "n_tractores": 1,
+    "pasos": 39777,
+    "completo": true,
+    "tiempo_real_s": 264.6677188873291
+  },
+  {
+    "n_harvesters": 4,
+    "n_tractores": 3,
+    "pasos": 10143,
+    "completo": true,
+    "tiempo_real_s": 146.15702080726624
+  },
+  {
+    "n_harvesters": 7,
+    "n_tractores": 5,
+    "pasos": 5563,
+    "completo": true,
+    "tiempo_real_s": 126.91331052780151
+  },
+  {
+    "n_harvesters": 9,
+    "n_tractores": 7,
+    "pasos": 4041,
+    "completo": true,
+    "tiempo_real_s": 199.61343789100647
+  }
+]
