@@ -1,9 +1,15 @@
 """Simulacion multiagente de cosecha: harvesters + tractores sobre un campo en grid."""
 
 import heapq
+import os
 
 import numpy as np
 import agentpy as ap
+
+from Qlearning import config as rl_config
+from Qlearning import harvester_rl, recompensas as rl_recompensas, tractor_rl
+from Qlearning import q_table as rl_q_table
+from Qlearning.agente_q import PoliticaQ
 
 CAMINO = 0
 LISTO = 1
@@ -158,6 +164,50 @@ class Maquina(ap.Agent):
         self.distancia = 0
         self.giros = 0
         self.recargas = 0
+        # estado de Q-learning (solo se usa si el parametro correspondiente
+        # de GranjaModel esta activado; sin activar, estos campos quedan
+        # sin tocar y no cambian el comportamiento de la maquina de estados).
+        self.rl_estado_pendiente = None
+        self.rl_accion_pendiente = None
+        self.rl_pasos_acumulados = 0
+        self.rl_eventos_acumulados = 0.0
+        self.rl_varado = False
+
+    def _rl_tick(self):
+        self.rl_pasos_acumulados += 1
+
+    def _rl_sumar_evento(self, valor):
+        self.rl_eventos_acumulados += valor
+
+    def _rl_marcar_varado(self):
+        self.rl_varado = True
+
+    def _rl_reset(self):
+        self.rl_estado_pendiente = None
+        self.rl_accion_pendiente = None
+        self.rl_pasos_acumulados = 0
+        self.rl_eventos_acumulados = 0.0
+        self.rl_varado = False
+
+    def _rl_cerrar(self, politica, terminal, estado_siguiente=None):
+        """Cierra la excursion de decision pendiente (si hay una) con una
+        actualizacion de Q, y reinicia los acumuladores para la proxima.
+
+        Una "excursion" es el tramo entre dos decisiones: el agente puede
+        quedar encerrado varios pasos en un estado sin voz (`recargando`,
+        `esperando_tractor`, `vertiendo`...) antes de volver a elegir algo,
+        asi que la recompensa de la decision que lo mando ahi se arma recien
+        aca, sumando lo que paso en todo ese tramo (ver Qlearning/recompensas.py).
+        """
+        if self.rl_estado_pendiente is None:
+            self._rl_reset()
+            return
+        recompensa = (self.rl_eventos_acumulados
+                      - rl_recompensas.COSTO_PASO * self.rl_pasos_acumulados
+                      - (rl_recompensas.PENALIZACION_VARADO if self.rl_varado else 0.0))
+        politica.actualizar(self.rl_estado_pendiente, self.rl_accion_pendiente,
+                            recompensa, None if terminal else estado_siguiente)
+        self._rl_reset()
 
     @property
     def ubicacion(self):
@@ -365,6 +415,10 @@ class Harvester(Maquina):
             self.estado = 'descompuesto'
 
     def step(self):
+        usar_rl = self.p.get('usar_qlearning_harvester', False)
+        if usar_rl:
+            self._rl_tick()
+
         if self.gasolina <= 0:
             # si justo se quedo sin gasolina al llegar a la base (moverse
             # gasta el ultimo tanque en el mismo paso que lo deja ahi), hay
@@ -376,6 +430,12 @@ class Harvester(Maquina):
                 self.estado = 'operando'
             else:
                 self.estado = 'sin_gasolina'
+                if usar_rl:
+                    # peor desenlace posible para la decision pendiente:
+                    # quedo varado e inmovil el resto de la corrida, no va a
+                    # volver a decidir nada -- cierre terminal, sin bootstrap.
+                    self._rl_marcar_varado()
+                    self._rl_cerrar(self.model.politica_q_harvester, terminal=True)
                 return
 
         if self.estado == 'descompuesto':
@@ -416,14 +476,37 @@ class Harvester(Maquina):
             self.llamarTractor()
             return
 
-        if self.estado == 'operando' and self.necesitaGasolina():
-            self._soltar_objetivo()
-            self.estado = 'recargando'
-            self.ruta = []
-            return
+        if self.estado == 'operando':
+            if usar_rl:
+                # punto de decision: reemplaza el umbral fijo de
+                # necesitaGasolina() por la politica aprendida. Se decide en
+                # todos los pasos operando (no solo cuando el tanque baja del
+                # umbral) para que el agente tambien pueda aprender a
+                # anticiparse. Antes de elegir, cierra la excursion anterior
+                # (la que llevo hasta este punto de decision) con el estado
+                # actual como resultado observado.
+                estado_actual = harvester_rl.discretizar_estado(self)
+                self._rl_cerrar(self.model.politica_q_harvester, terminal=False,
+                                estado_siguiente=estado_actual)
+                accion = self.model.politica_q_harvester.elegir_accion(estado_actual)
+                self.rl_estado_pendiente = estado_actual
+                self.rl_accion_pendiente = accion
+                if accion == harvester_rl.IR_A_RECARGAR:
+                    self._soltar_objetivo()
+                    self.estado = 'recargando'
+                    self.ruta = []
+                    return
+            elif self.necesitaGasolina():
+                self._soltar_objetivo()
+                self.estado = 'recargando'
+                self.ruta = []
+                return
 
         if self.p.prob_descompostura > 0 and self.model.nprandom.random() < self.p.prob_descompostura:
             self._descomponer()
+            if usar_rl:
+                # se rompio: como en el varado, no va a volver a decidir.
+                self._rl_cerrar(self.model.politica_q_harvester, terminal=True)
             return
 
         if not self.ruta:
@@ -434,6 +517,8 @@ class Harvester(Maquina):
                 self.carga += 1
                 self.model.cosechado += 1
                 self.model.reservadas.discard(celda)
+                if usar_rl:
+                    self._rl_sumar_evento(rl_recompensas.R_CELDA_COSECHADA)
                 if self.carga >= self.capacidad:
                     break
 
@@ -493,6 +578,10 @@ class Tractor(Maquina):
         self.moverse()
 
     def step(self):
+        usar_rl = self.p.get('usar_qlearning_tractor', False)
+        if usar_rl:
+            self._rl_tick()
+
         if self.gasolina <= 0:
             # mismo caso que en Harvester: si el ultimo tanque alcanzo justo
             # para llegar al deposito, recargar aqui en vez de quedar
@@ -501,6 +590,8 @@ class Tractor(Maquina):
             # celdas vecinas pero distintas: solo entrega grano si de
             # casualidad quedo tirado justo sobre el silo.
             if self.ubicacion == self.model.silo and self.carga > 0:
+                if usar_rl:
+                    self._rl_sumar_evento(rl_recompensas.R_GRANO_ENTREGADO * self.carga)
                 self.model.entregado += self.carga
                 self.carga = 0
             if self.ubicacion in (self.model.base, self.model.silo):
@@ -512,6 +603,9 @@ class Tractor(Maquina):
                 self.estado = 'libre'
             else:
                 self.estado = 'sin_gasolina'
+                if usar_rl:
+                    self._rl_marcar_varado()
+                    self._rl_cerrar(self.model.politica_q_tractor, terminal=True)
                 return
 
         if self.carga >= self.capacidad and self.estado != 'descargando':
@@ -528,6 +622,8 @@ class Tractor(Maquina):
 
         if self.estado == 'al_silo':
             if self.ubicacion == self.model.silo:
+                if usar_rl and self.carga > 0:
+                    self._rl_sumar_evento(rl_recompensas.R_GRANO_ENTREGADO * self.carga)
                 self.model.entregado += self.carga
                 self.carga = 0
                 self.estado = 'libre'
@@ -567,12 +663,27 @@ class Tractor(Maquina):
                 self.liberar()
             return
 
-        # estado 'libre' o 'escoltando': sin carga y sin llamada activa
+        # estado 'libre' o 'escoltando': sin carga y sin llamada activa --
+        # punto de decision para Q-learning (esperar/escoltar vs recargar
+        # preventivamente). La asignacion de llamadas (que tractor atiende a
+        # que harvester) sigue siendo por cercania via
+        # GranjaModel.solicitar_tractor, sin Q-learning todavia.
         if self.carga > 0 and self.ubicacion != self.model.silo:
             self.estado = 'al_silo'
             return
 
-        if self.necesitaGasolina():
+        if usar_rl:
+            estado_actual = tractor_rl.discretizar_estado(self)
+            self._rl_cerrar(self.model.politica_q_tractor, terminal=False,
+                            estado_siguiente=estado_actual)
+            accion = self.model.politica_q_tractor.elegir_accion(estado_actual)
+            self.rl_estado_pendiente = estado_actual
+            self.rl_accion_pendiente = accion
+            if accion == tractor_rl.IR_A_RECARGAR:
+                self.estado = 'recargando'
+                self.ruta = []
+                return
+        elif self.necesitaGasolina():
             self.estado = 'recargando'
             self.ruta = []
             return
@@ -653,6 +764,39 @@ class GranjaModel(ap.Model):
         for i, tractor in enumerate(self.tractores):
             tractor.harvester_seguido = self.harvesters[i % len(self.harvesters)]
 
+        # Q-learning: desactivado por defecto (ver PARAMETROS). Cuando esta
+        # activo, retoma la tabla guardada por una corrida anterior (asi el
+        # aprendizaje se acumula corrida a corrida) en vez de arrancar de
+        # cero cada vez; `end()` la vuelve a guardar al terminar.
+        self.usar_qlearning_harvester = self.p.get('usar_qlearning_harvester', False)
+        self.usar_qlearning_tractor = self.p.get('usar_qlearning_tractor', False)
+        alpha = self.p.get('qlearning_alpha', rl_config.ALPHA)
+        gamma = self.p.get('qlearning_gamma', rl_config.GAMMA)
+        epsilon = self.p.get('qlearning_epsilon', rl_config.EPSILON)
+
+        if self.usar_qlearning_harvester:
+            tabla = self._cargar_o_crear_tabla_q(rl_config.RUTA_TABLA_HARVESTER,
+                                                 harvester_rl.crear_tabla_inicial)
+            self.politica_q_harvester = PoliticaQ(tabla, harvester_rl.ACCIONES,
+                                                  alpha, gamma, epsilon, rng=self.nprandom)
+
+        if self.usar_qlearning_tractor:
+            tabla = self._cargar_o_crear_tabla_q(rl_config.RUTA_TABLA_TRACTOR,
+                                                 tractor_rl.crear_tabla_inicial)
+            # de las 3 acciones definidas en tractor_rl, por ahora solo se
+            # entrena la decision propia del tractor (esperar/recargar);
+            # ATENDER_LLAMADA queda definida para una integracion futura con
+            # el despacho de GranjaModel.solicitar_tractor.
+            acciones = (tractor_rl.ESPERAR, tractor_rl.IR_A_RECARGAR)
+            self.politica_q_tractor = PoliticaQ(tabla, acciones,
+                                                alpha, gamma, epsilon, rng=self.nprandom)
+
+    @staticmethod
+    def _cargar_o_crear_tabla_q(ruta, crear_inicial):
+        if os.path.exists(ruta):
+            return rl_q_table.cargar(ruta)
+        return crear_inicial()
+
     def celdas_ocupadas(self, excepto=None, incluir_parados=True):
         """Celdas con un agente encima. Con `incluir_parados=False` ignora los
         agentes detenidos-pero-con-gasolina (tractor escoltando, harvester
@@ -717,6 +861,13 @@ class GranjaModel(ap.Model):
         self.report('recargas_totales', int(sum(self.harvesters.recargas)
                                             + sum(self.tractores.recargas)))
 
+        # guarda las tablas Q actualizadas para que la proxima corrida
+        # retome el aprendizaje de esta en vez de arrancar de cero.
+        if self.usar_qlearning_harvester:
+            rl_q_table.guardar(self.politica_q_harvester.tabla, rl_config.RUTA_TABLA_HARVESTER)
+        if self.usar_qlearning_tractor:
+            rl_q_table.guardar(self.politica_q_tractor.tabla, rl_config.RUTA_TABLA_TRACTOR)
+
 
 PARAMETROS = {
     'shape': (40, 40),
@@ -740,4 +891,11 @@ PARAMETROS = {
     'prob_descompostura': 0.0,
     'seed': 1,
     'steps': 1200,
+    # desactivado por defecto: con esto en False el modelo se comporta
+    # exactamente igual que antes (logica de umbral fijo). Ver Qlearning/.
+    'usar_qlearning_harvester': False,
+    'usar_qlearning_tractor': False,
+    'qlearning_alpha': rl_config.ALPHA,
+    'qlearning_gamma': rl_config.GAMMA,
+    'qlearning_epsilon': rl_config.EPSILON,
 }
