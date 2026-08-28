@@ -154,6 +154,9 @@ class Maquina(ap.Agent):
     capacidad = 0
     gasolina_max = 300.0
     consumo = 1.0
+    # penalizacion de varado por defecto para Q-learning; cada subclase la
+    # sobreescribe con la propia (ver Qlearning/recompensas.py).
+    rl_penalizacion_varado = rl_recompensas.PENALIZACION_VARADO_TRACTOR
 
     def setup(self):
         self.ruta = []
@@ -172,6 +175,7 @@ class Maquina(ap.Agent):
         self.rl_pasos_acumulados = 0
         self.rl_eventos_acumulados = 0.0
         self.rl_varado = False
+        self.rl_costo_paso = rl_recompensas.COSTO_PASO
 
     def _rl_tick(self):
         self.rl_pasos_acumulados += 1
@@ -188,6 +192,7 @@ class Maquina(ap.Agent):
         self.rl_pasos_acumulados = 0
         self.rl_eventos_acumulados = 0.0
         self.rl_varado = False
+        self.rl_costo_paso = rl_recompensas.COSTO_PASO
 
     def _rl_cerrar(self, politica, terminal, estado_siguiente=None):
         """Cierra la excursion de decision pendiente (si hay una) con una
@@ -198,13 +203,19 @@ class Maquina(ap.Agent):
         `esperando_tractor`, `vertiendo`...) antes de volver a elegir algo,
         asi que la recompensa de la decision que lo mando ahi se arma recien
         aca, sumando lo que paso en todo ese tramo (ver Qlearning/recompensas.py).
+
+        El costo por paso usado es `self.rl_costo_paso`, fijado al elegir la
+        accion (ver Harvester.step/Tractor.step): mas bajo durante toda la
+        excursion de ir a recargar que durante la de seguir operando, para
+        que el viaje no compita en la misma escala que el costo de demora
+        normal (ver COSTO_PASO_RECARGA en Qlearning/recompensas.py).
         """
         if self.rl_estado_pendiente is None:
             self._rl_reset()
             return
         recompensa = (self.rl_eventos_acumulados
-                      - rl_recompensas.COSTO_PASO * self.rl_pasos_acumulados
-                      - (rl_recompensas.PENALIZACION_VARADO if self.rl_varado else 0.0))
+                      - self.rl_costo_paso * self.rl_pasos_acumulados
+                      - (self.rl_penalizacion_varado if self.rl_varado else 0.0))
         politica.actualizar(self.rl_estado_pendiente, self.rl_accion_pendiente,
                             recompensa, None if terminal else estado_siguiente)
         self._rl_reset()
@@ -275,6 +286,8 @@ class Maquina(ap.Agent):
 
 class Harvester(Maquina):
     """Cosechadora: recorre el cultivo, y al llenarse llama a un tractor."""
+
+    rl_penalizacion_varado = rl_recompensas.PENALIZACION_VARADO_HARVESTER
 
     def setup(self):
         super().setup()
@@ -462,6 +475,16 @@ class Harvester(Maquina):
 
         if self.estado == 'recargando':
             if self.ubicacion == self.model.base:
+                if usar_rl:
+                    # proporcional a lo que realmente hacia falta: si no,
+                    # un harvester ya parado sobre la base podria entrar y
+                    # salir de 'recargando' sin moverse (excursion de costo
+                    # ~0) y cobrar el bono completo cada vez con el tanque
+                    # ya lleno -- un ciclo gratis que no cuesta nada y no
+                    # cosecha nada (se observo en pruebas: un harvester
+                    # recargando miles de veces sin avanzar).
+                    frac_faltante = 1.0 - self.gasolina / self.gasolina_max
+                    self._rl_sumar_evento(rl_recompensas.R_TANQUE_LLENADO * frac_faltante)
                 self.cargarGasolina()
                 self.estado = 'operando'
             else:
@@ -492,6 +515,11 @@ class Harvester(Maquina):
                 self.rl_estado_pendiente = estado_actual
                 self.rl_accion_pendiente = accion
                 if accion == harvester_rl.IR_A_RECARGAR:
+                    # costo por paso mas bajo durante esta excursion (ver
+                    # COSTO_PASO_RECARGA en Qlearning/recompensas.py): el
+                    # viaje a la base no debe competir en la misma escala
+                    # que el costo de demora de seguir cosechando.
+                    self.rl_costo_paso = rl_recompensas.COSTO_PASO_RECARGA
                     self._soltar_objetivo()
                     self.estado = 'recargando'
                     self.ruta = []
@@ -526,6 +554,8 @@ class Harvester(Maquina):
 class Tractor(Maquina):
     """Contenedor movil: sigue a un harvester mientras cosecha, acude a su
     llamada al llenarse, le recibe la carga y la lleva al silo."""
+
+    rl_penalizacion_varado = rl_recompensas.PENALIZACION_VARADO_TRACTOR
 
     def setup(self):
         super().setup()
@@ -680,6 +710,9 @@ class Tractor(Maquina):
             self.rl_estado_pendiente = estado_actual
             self.rl_accion_pendiente = accion
             if accion == tractor_rl.IR_A_RECARGAR:
+                # mismo costo por paso reducido que Harvester.step (ver
+                # COSTO_PASO_RECARGA en Qlearning/recompensas.py).
+                self.rl_costo_paso = rl_recompensas.COSTO_PASO_RECARGA
                 self.estado = 'recargando'
                 self.ruta = []
                 return
