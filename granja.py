@@ -302,6 +302,7 @@ class Harvester(Maquina):
         self.tractor_asignado = None
         self.zona = None
         self.averiado = False
+        self.cosechado_total = 0  # celdas cosechadas acumuladas (no baja al vertir, a diferencia de self.carga)
         # penaliza (sin prohibir) pisar cultivo ya cosechado en los viajes
         # de ida/vuelta a la gasolinera: rodea por camino de tierra si el
         # desvio no sale mucho mas caro que ir en linea recta.
@@ -543,6 +544,7 @@ class Harvester(Maquina):
         for celda in self.moverse():
             if self.model.campo.cosechar(celda):
                 self.carga += 1
+                self.cosechado_total += 1
                 self.model.cosechado += 1
                 self.model.reservadas.discard(celda)
                 if usar_rl:
@@ -760,8 +762,12 @@ class GranjaModel(ap.Model):
         # un rodeo porque el camino directo "existe" sobre el papel). La
         # fila 0 siempre es camino perimetral completo sin importar
         # `ancho_camino`, asi que estas celdas estan garantizadas transitables.
-        self.silo = (0, 0)
-        self.base = (0, min(3, self.campo.shape[1] - 1))
+        # `silo_pos`/`base_pos` permiten ubicarlas en otro lado (p.ej. sobre
+        # la cruz de camino central) siempre que el llamador respete las
+        # mismas dos condiciones de arriba: caer en camino y quedar
+        # separadas por varias celdas, no solo vecinas.
+        self.silo = self.p.get('silo_pos') or (0, 0)
+        self.base = self.p.get('base_pos') or (0, min(3, self.campo.shape[1] - 1))
         self.reservadas = set()
         self.cosechado = 0
         self.transferido = 0
@@ -922,6 +928,11 @@ PARAMETROS = {
     'penalizacion_cosechado_tractor': 3.0,
     'penalizacion_cosechado_harvester': 3.0,
     'prob_descompostura': 0.0,
+    # None = ubicacion por defecto en la esquina (ver GranjaModel.setup);
+    # se puede sobreescribir con cualquier celda de camino, siempre que
+    # ambas queden separadas por varias celdas (no solo vecinas).
+    'silo_pos': None,
+    'base_pos': None,
     'seed': 1,
     'steps': 1200,
     # desactivado por defecto: con esto en False el modelo se comporta
