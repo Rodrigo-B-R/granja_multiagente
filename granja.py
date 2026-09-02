@@ -146,6 +146,18 @@ class Campo(ap.Grid):
         return min(self.celdas_camino,
                    key=lambda c: abs(c[0] - pos[0]) + abs(c[1] - pos[1]))
 
+    def celda_adyacente_transitable(self, pos):
+        """Celda transitable vecina a `pos`, para pararse "al lado" de algo
+        (silo, base) en vez de encima. Prefiere camino sobre cultivo."""
+        filas, columnas = self.shape
+        vecinas = [(pos[0] + df, pos[1] + dc) for df, dc in DIRECCIONES
+                   if 0 <= pos[0] + df < filas and 0 <= pos[1] + dc < columnas]
+        transitables = [v for v in vecinas if self.terreno[v] in TRANSITABLE]
+        if not transitables:
+            return pos  # rodeado de obstaculos: no deberia pasar con el terreno actual
+        caminos = [v for v in transitables if self.terreno[v] == CAMINO]
+        return caminos[0] if caminos else transitables[0]
+
 
 class Maquina(ap.Agent):
     """Base comun: se mueve por una ruta A*, gira, se detiene y gasta gasolina."""
@@ -231,6 +243,10 @@ class Maquina(ap.Agent):
         # acceso a un rincon de cultivo.
         bloqueadas = (self.model.celdas_ocupadas(excepto=self, incluir_parados=False)
                       if evitar_agentes else frozenset())
+        # silo y base son solo puntos de referencia visuales (el edificio),
+        # nadie debe planear su ruta pisandolos: se para en punto_silo /
+        # punto_base, la celda transitable de al lado (ver GranjaModel.setup).
+        bloqueadas = bloqueadas | {self.model.silo, self.model.base}
         self.ruta = a_estrella(self.model.campo.terreno, self.ubicacion, meta, bloqueadas, transitables, costos)
         return bool(self.ruta)
 
@@ -439,7 +455,7 @@ class Harvester(Maquina):
             # que recargarlo aqui: si no, queda sin_gasolina para siempre
             # parado exactamente sobre la gasolinera, bloqueando a cualquiera
             # que necesite pasar por esa unica celda.
-            if self.ubicacion == self.model.base:
+            if self.ubicacion == self.model.punto_base:
                 self.cargarGasolina()
                 self.estado = 'operando'
             else:
@@ -475,7 +491,7 @@ class Harvester(Maquina):
             return
 
         if self.estado == 'recargando':
-            if self.ubicacion == self.model.base:
+            if self.ubicacion == self.model.punto_base:
                 if usar_rl:
                     # proporcional a lo que realmente hacia falta: si no,
                     # un harvester ya parado sobre la base podria entrar y
@@ -490,7 +506,7 @@ class Harvester(Maquina):
                 self.estado = 'operando'
             else:
                 if not self.ruta:
-                    self.definirRuta(self.model.base, costos=self.costos_ruta)
+                    self.definirRuta(self.model.punto_base, costos=self.costos_ruta)
                 self.moverse()
             return
 
@@ -621,12 +637,12 @@ class Tractor(Maquina):
             # de paso obligado para otros (silo o base). Silo y base son
             # celdas vecinas pero distintas: solo entrega grano si de
             # casualidad quedo tirado justo sobre el silo.
-            if self.ubicacion == self.model.silo and self.carga > 0:
+            if self.ubicacion == self.model.punto_silo and self.carga > 0:
                 if usar_rl:
                     self._rl_sumar_evento(rl_recompensas.R_GRANO_ENTREGADO * self.carga)
                 self.model.entregado += self.carga
                 self.carga = 0
-            if self.ubicacion in (self.model.base, self.model.silo):
+            if self.ubicacion in (self.model.punto_base, self.model.punto_silo):
                 self.cargarGasolina()
                 if self.cliente is not None:
                     if self.cliente.tractor_asignado is self:
@@ -645,22 +661,22 @@ class Tractor(Maquina):
             self.estado = 'al_silo'
 
         if self.estado == 'recargando':
-            if self.ubicacion == self.model.base:
+            if self.ubicacion == self.model.punto_base:
                 self.cargarGasolina()
                 self.estado = 'libre'
             else:
-                self._ir_hacia(self.model.base)
+                self._ir_hacia(self.model.punto_base)
             return
 
         if self.estado == 'al_silo':
-            if self.ubicacion == self.model.silo:
+            if self.ubicacion == self.model.punto_silo:
                 if usar_rl and self.carga > 0:
                     self._rl_sumar_evento(rl_recompensas.R_GRANO_ENTREGADO * self.carga)
                 self.model.entregado += self.carga
                 self.carga = 0
                 self.estado = 'libre'
             else:
-                self._ir_hacia(self.model.silo)
+                self._ir_hacia(self.model.punto_silo)
             return
 
         if self.estado == 'en_camino':
@@ -700,7 +716,7 @@ class Tractor(Maquina):
         # preventivamente). La asignacion de llamadas (que tractor atiende a
         # que harvester) sigue siendo por cercania via
         # GranjaModel.solicitar_tractor, sin Q-learning todavia.
-        if self.carga > 0 and self.ubicacion != self.model.silo:
+        if self.carga > 0 and self.ubicacion != self.model.punto_silo:
             self.estado = 'al_silo'
             return
 
@@ -762,12 +778,25 @@ class GranjaModel(ap.Model):
         # un rodeo porque el camino directo "existe" sobre el papel). La
         # fila 0 siempre es camino perimetral completo sin importar
         # `ancho_camino`, asi que estas celdas estan garantizadas transitables.
-        # `silo_pos`/`base_pos` permiten ubicarlas en otro lado (p.ej. sobre
-        # la cruz de camino central) siempre que el llamador respete las
-        # mismas dos condiciones de arriba: caer en camino y quedar
-        # separadas por varias celdas, no solo vecinas.
-        self.silo = self.p.get('silo_pos') or (0, 0)
-        self.base = self.p.get('base_pos') or (0, min(3, self.campo.shape[1] - 1))
+        # `silo_pos`/`base_pos` permiten ubicarlas en otro lado siempre que
+        # el llamador respete las mismas dos condiciones de arriba: caer en
+        # camino y quedar separadas por varias celdas, no solo vecinas. Por
+        # default van sobre la fila de la cruz de camino central (esa fila
+        # es camino en todas sus columnas, ver Campo.setup), una a cada lado
+        # del centro para no quedar vecinas entre si.
+        filas, columnas = self.campo.shape
+        centro_f, centro_c = filas // 2, columnas // 2
+        separacion = max(4, columnas // 4)
+        self.silo = self.p.get('silo_pos') or (centro_f, max(0, centro_c - separacion))
+        self.base = self.p.get('base_pos') or (centro_f, min(columnas - 1, centro_c + separacion))
+
+        # los agentes nunca planean su ruta pisando la celda del silo/base en
+        # si (ver Maquina.definirRuta): se paran en la celda transitable de
+        # al lado para cargar gasolina o descargar grano, no encima del
+        # edificio.
+        self.punto_silo = self.campo.celda_adyacente_transitable(self.silo)
+        self.punto_base = self.campo.celda_adyacente_transitable(self.base)
+
         self.reservadas = set()
         self.cosechado = 0
         self.transferido = 0
