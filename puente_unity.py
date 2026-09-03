@@ -2,8 +2,24 @@
 
 Python corre la simulacion paso a paso (agentpy `sim_setup`/`sim_step`) y hace
 push del estado por WebSocket: un mensaje `init` con el entorno completo al
-conectar, un mensaje `paso` por cada paso simulado (agentes + celdas recien
-cosechadas, no el grid completo), y un mensaje `fin` con los reportes.
+conectar (o al reiniciar), un mensaje `paso` por cada paso simulado (agentes +
+celdas recien cosechadas, no el grid completo), y un mensaje `fin` con los
+reportes.
+
+La comunicacion es bidireccional: Unity puede mandar comandos de control en
+cualquier momento, en el mismo socket, como mensajes JSON `{"tipo": ...}`:
+
+    {"tipo": "pausar"}
+    {"tipo": "reanudar"}
+    {"tipo": "reiniciar", "parametros": {"shape": [F, C], "n_harvesters": N,
+                                          "n_tractores": M, "seed": S,
+                                          "steps": ST}}
+
+`reiniciar` puede traer cualquier subconjunto de PARAMETROS (ver mas abajo);
+los que no se manden conservan su valor actual. Como el grid y el numero de
+agentes son fijos una vez creado el modelo de agentpy, reiniciar siempre
+recrea el GranjaModel desde cero y vuelve a mandar un `init` fresco, sin
+cerrar el socket.
 
 Uso:
     python puente_unity.py [--host localhost] [--port 8765] [--intervalo 0.2]
@@ -12,6 +28,7 @@ Uso:
 
 import argparse
 import asyncio
+import contextlib
 import json
 import random
 
@@ -98,24 +115,92 @@ def _construir_paso(model, mascara_cosechado_previo):
     }
 
 
+class ControlSimulacion:
+    """Estado compartido entre la tarea que corre la simulacion y la que
+    escucha comandos del cliente, para el mismo websocket."""
+
+    def __init__(self, parametros):
+        self.parametros = dict(parametros)
+        self.pausado = asyncio.Event()
+        self.reiniciar = asyncio.Event()
+        self.cerrado = False
+
+
+async def _escuchar_comandos(websocket, control):
+    try:
+        async for mensaje in websocket:
+            try:
+                datos = json.loads(mensaje)
+            except json.JSONDecodeError:
+                print(f'Comando invalido (no es JSON): {mensaje!r}')
+                continue
+
+            tipo = datos.get('tipo')
+            if tipo == 'pausar':
+                control.pausado.set()
+            elif tipo == 'reanudar':
+                control.pausado.clear()
+            elif tipo == 'reiniciar':
+                nuevos = datos.get('parametros') or {}
+                if 'shape' in nuevos:
+                    nuevos['shape'] = tuple(nuevos['shape'])
+                control.parametros.update(nuevos)
+                control.pausado.clear()
+                control.reiniciar.set()
+            else:
+                print(f'Comando desconocido del cliente: {tipo!r}')
+    except websockets.ConnectionClosed:
+        pass
+    finally:
+        control.cerrado = True
+        control.reiniciar.set()  # despierta el loop de simulacion si estaba en pausa
+
+
+async def _correr_simulacion(websocket, control, intervalo):
+    while not control.cerrado:
+        control.reiniciar.clear()
+
+        # nunca aprendizaje automatico en el puente, sin importar lo que
+        # traiga `parametros`: es una visualizacion de la politica fija.
+        p = dict(control.parametros, usar_qlearning_harvester=False,
+                 usar_qlearning_tractor=False)
+        seed = p.get('seed') or 1
+        model = GranjaModel(p)
+        model.sim_setup(steps=p.get('steps'), seed=seed)
+        await websocket.send(json.dumps(_construir_init(model, seed)))
+
+        mascara_cosechado_previo = model.campo.terreno == COSECHADO
+        terminado_naturalmente = False
+        while model.running:
+            if control.reiniciar.is_set() or control.cerrado:
+                break
+            if control.pausado.is_set():
+                await asyncio.sleep(0.05)
+                continue
+            model.sim_step()
+            await websocket.send(json.dumps(_construir_paso(model, mascara_cosechado_previo)))
+            await asyncio.sleep(intervalo)
+        else:
+            terminado_naturalmente = True
+
+        if control.reiniciar.is_set() and not control.cerrado:
+            continue  # vuelve a armar el modelo con los parametros nuevos
+
+        model.end()
+        if not control.cerrado and terminado_naturalmente:
+            await websocket.send(json.dumps({'tipo': 'fin', 'reportes': dict(model.reporters)}))
+        break
+
+
 async def _manejar_cliente(websocket, parametros, intervalo):
-    # nunca aprendizaje automatico en el puente, sin importar lo que traiga
-    # `parametros`: es una visualizacion de la politica fija, no un entrenamiento.
-    p = dict(parametros, usar_qlearning_harvester=False, usar_qlearning_tractor=False)
-    model = GranjaModel(p)
-    model.sim_setup(steps=p.get('steps'), seed=p.get('seed'))
-
-    seed = p.get('seed') or 1
-    await websocket.send(json.dumps(_construir_init(model, seed)))
-
-    mascara_cosechado_previo = model.campo.terreno == COSECHADO
-    while model.running:
-        model.sim_step()
-        await websocket.send(json.dumps(_construir_paso(model, mascara_cosechado_previo)))
-        await asyncio.sleep(intervalo)
-
-    model.end()
-    await websocket.send(json.dumps({'tipo': 'fin', 'reportes': dict(model.reporters)}))
+    control = ControlSimulacion(parametros)
+    tarea_comandos = asyncio.create_task(_escuchar_comandos(websocket, control))
+    try:
+        await _correr_simulacion(websocket, control, intervalo)
+    finally:
+        tarea_comandos.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await tarea_comandos
 
 
 async def main():
