@@ -938,7 +938,7 @@ class GranjaModel(ap.Model):
 
 
 PARAMETROS = {
-    'shape': (40, 40),
+    'shape': (30, 30),
     'ancho_camino': 2,
     'pct_obstaculos': 0.02,
     'n_harvesters': 3,
@@ -946,11 +946,11 @@ PARAMETROS = {
     'tamano_harvester': 2,
     'velocidad_harvester': 1,
     'capacidad_harvester': 25,
-    'gasolina_harvester': 1200,
+    'gasolina_harvester': 900,
     'consumo_harvester': 1.0,
     'velocidad_tractor': 2,
     'capacidad_tractor': 80,
-    'gasolina_tractor': 1500,
+    'gasolina_tractor': 600,
     'consumo_tractor': 0.7,
     'tasa_vertido': 8,
     'umbral_gasolina': 0.2,
@@ -963,7 +963,7 @@ PARAMETROS = {
     'silo_pos': None,
     'base_pos': None,
     'seed': 1,
-    'steps': 1200,
+    'steps': 500,
     # desactivado por defecto: con esto en False el modelo se comporta
     # exactamente igual que antes (logica de umbral fijo). Ver Qlearning/.
     'usar_qlearning_harvester': False,
