@@ -89,6 +89,10 @@ def _estado_agente(agente, clase):
         'estado': agente.estado,
         'gasolina': round(float(agente.gasolina), 2),
         'carga': int(agente.carga),
+        # solo los harvesters cosechan; los tractores siempre mandan 0 aca.
+        # A diferencia de 'carga' (baja al vertir en el tractor), este
+        # nunca baja: es el total acumulado desde que arranco la sim.
+        'cosechado_total': int(getattr(agente, 'cosechado_total', 0)),
     }
 
 
@@ -109,8 +113,11 @@ def _construir_paso(model, mascara_cosechado_previo):
         'metricas': {
             'cosechado_pct': 100 * model.cosechado / model.campo.total_cultivo,
             'grano_entregado': model.entregado,
-            'gasolina_total': float(sum(model.harvesters.gasolina)
-                                    + sum(model.tractores.gasolina)),
+            'recargas_totales': int(sum(model.harvesters.recargas)
+                                    + sum(model.tractores.recargas)),
+            'distancia_total': int(sum(model.harvesters.distancia)
+                                   + sum(model.tractores.distancia)),
+            'descomposturas_totales': int(sum(h.averiado for h in model.harvesters)),
         },
     }
 

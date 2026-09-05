@@ -928,6 +928,7 @@ class GranjaModel(ap.Model):
                                          + sum(self.tractores.giros)))
         self.report('recargas_totales', int(sum(self.harvesters.recargas)
                                             + sum(self.tractores.recargas)))
+        self.report('descomposturas_totales', int(sum(h.averiado for h in self.harvesters)))
 
         # guarda las tablas Q actualizadas para que la proxima corrida
         # retome el aprendizaje de esta en vez de arrancar de cero.
@@ -946,11 +947,11 @@ PARAMETROS = {
     'tamano_harvester': 2,
     'velocidad_harvester': 1,
     'capacidad_harvester': 25,
-    'gasolina_harvester': 900,
+    'gasolina_harvester': 300,
     'consumo_harvester': 1.0,
     'velocidad_tractor': 2,
     'capacidad_tractor': 80,
-    'gasolina_tractor': 600,
+    'gasolina_tractor': 200,
     'consumo_tractor': 0.7,
     'tasa_vertido': 8,
     'umbral_gasolina': 0.2,
