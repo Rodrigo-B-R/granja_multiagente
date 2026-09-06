@@ -19,7 +19,9 @@ cualquier momento, en el mismo socket, como mensajes JSON `{"tipo": ...}`:
 los que no se manden conservan su valor actual. Como el grid y el numero de
 agentes son fijos una vez creado el modelo de agentpy, reiniciar siempre
 recrea el GranjaModel desde cero y vuelve a mandar un `init` fresco, sin
-cerrar el socket.
+cerrar el socket. Esto tambien aplica cuando la simulacion ya termino
+naturalmente (mensaje `fin` enviado): el socket se queda abierto esperando un
+`reiniciar` de Unity en vez de cerrarse.
 
 Uso:
     python puente_unity.py [--host localhost] [--port 8765] [--intervalo 0.2]
@@ -194,8 +196,19 @@ async def _correr_simulacion(websocket, control, intervalo):
             continue  # vuelve a armar el modelo con los parametros nuevos
 
         model.end()
-        if not control.cerrado and terminado_naturalmente:
+        if control.cerrado:
+            break
+
+        if terminado_naturalmente:
             await websocket.send(json.dumps({'tipo': 'fin', 'reportes': dict(model.reporters)}))
+            # la simulacion termino pero el socket sigue abierto: se queda
+            # esperando un "reiniciar" de Unity (o el cierre de la conexion)
+            # en vez de terminar la tarea y tumbar la conexion.
+            control.reiniciar.clear()
+            await control.reiniciar.wait()
+            if not control.cerrado:
+                continue
+
         break
 
 
