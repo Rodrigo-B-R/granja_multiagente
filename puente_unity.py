@@ -227,7 +227,7 @@ async def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--host', default='localhost')
     parser.add_argument('--port', type=int, default=8765)
-    parser.add_argument('--intervalo', type=float, default=0.6,
+    parser.add_argument('--intervalo', type=float, default=0.2,
                         help='segundos reales de espera entre pasos simulados')
     parser.add_argument('--shape', type=int, nargs=2, metavar=('FILAS', 'COLUMNAS'))
     parser.add_argument('--steps', type=int)
