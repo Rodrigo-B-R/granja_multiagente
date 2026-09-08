@@ -154,6 +154,17 @@ async def _escuchar_comandos(websocket, control):
                 nuevos = datos.get('parametros') or {}
                 if 'shape' in nuevos:
                     nuevos['shape'] = tuple(nuevos['shape'])
+                # Unity manda estos dos en escala 0-100 (el dashboard los
+                # muestra como "Porcentaje de Obstaculos" / "Probabilidad de
+                # Descompostura"), pero granja.py los usa como fraccion 0-1
+                # (ver PARAMETROS y Campo.setup/Maquina._intentar_averiar).
+                # Sin este ajuste, un "10" se interpreta como 10.0 (pide 10x
+                # mas obstaculos de los que caben en el grid, y Campo.setup
+                # lo recorta al maximo posible: convierte TODO el cultivo en
+                # obstaculos, dejando 0% de trigo listo).
+                for campo_pct in ('pct_obstaculos', 'prob_descompostura'):
+                    if campo_pct in nuevos:
+                        nuevos[campo_pct] = nuevos[campo_pct] / 100.0
                 control.parametros.update(nuevos)
                 control.pausado.clear()
                 control.reiniciar.set()
@@ -219,8 +230,15 @@ async def _correr_simulacion(websocket, control, intervalo):
             await websocket.send(json.dumps({'tipo': 'fin', 'reportes': dict(model.reporters)}))
             # la simulacion termino pero el socket sigue abierto: se queda
             # esperando un "reiniciar" de Unity (o el cierre de la conexion)
-            # en vez de terminar la tarea y tumbar la conexion.
-            control.reiniciar.clear()
+            # en vez de terminar la tarea y tumbar la conexion. No limpiar
+            # `reiniciar` aca: si Unity lo manda apenas recibe "fin", puede
+            # llegar durante el `send` de arriba (el await cede el control a
+            # `_escuchar_comandos`) y quedaria seteado antes de este punto;
+            # limpiarlo lo perderia sin que nadie lo atienda, dejando el
+            # `wait()` de abajo esperando para siempre un segundo reiniciar
+            # que Unity nunca manda. El loop externo ya lo limpia al arrancar
+            # la proxima corrida (linea de `control.reiniciar.clear()` al
+            # tope del while).
             await control.reiniciar.wait()
             if not control.cerrado:
                 continue
