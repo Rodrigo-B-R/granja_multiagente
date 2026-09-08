@@ -123,6 +123,7 @@ class Campo(ap.Grid):
 
         celdas_cultivo = np.argwhere(self.terreno == LISTO)
         n_obstaculos = int(len(celdas_cultivo) * pct_obstaculos)
+        n_obstaculos = max(0, min(n_obstaculos, len(celdas_cultivo)))
         elegidas = self.model.nprandom.choice(
             len(celdas_cultivo), size=n_obstaculos, replace=False)
         for idx in elegidas:
@@ -908,7 +909,12 @@ class GranjaModel(ap.Model):
             self.stop()
 
     def update(self):
-        self.record('cosechado_pct', 100 * self.cosechado / self.campo.total_cultivo)
+        # total_cultivo puede quedar en 0 con shapes muy chicos combinados con
+        # ancho_camino grande (todo el terreno termina siendo camino): no hay
+        # nada que cosechar, asi que se reporta 100% en vez de dividir por 0.
+        pct = 100.0 if self.campo.total_cultivo == 0 else \
+            100 * self.cosechado / self.campo.total_cultivo
+        self.record('cosechado_pct', pct)
         self.record('grano_entregado', self.entregado)
         self.record('gasolina_total', float(sum(self.harvesters.gasolina)
                                             + sum(self.tractores.gasolina)))
@@ -917,7 +923,11 @@ class GranjaModel(ap.Model):
 
     def end(self):
         self.report('pasos', self.t)
-        self.report('cosechado_pct', 100 * self.cosechado / self.campo.total_cultivo)
+        # ver comentario equivalente en update(): total_cultivo puede quedar
+        # en 0 con shapes muy chicos combinados con ancho_camino grande.
+        pct = 100.0 if self.campo.total_cultivo == 0 else \
+            100 * self.cosechado / self.campo.total_cultivo
+        self.report('cosechado_pct', pct)
         self.report('grano_entregado', self.entregado)
         self.report('distancia_total', int(sum(self.harvesters.distancia)
                                            + sum(self.tractores.distancia)))

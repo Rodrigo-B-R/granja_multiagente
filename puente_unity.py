@@ -113,7 +113,8 @@ def _construir_paso(model, mascara_cosechado_previo):
         'agentes': agentes,
         'cosechadas': [[int(fila), int(col)] for fila, col in nuevas],
         'metricas': {
-            'cosechado_pct': 100 * model.cosechado / model.campo.total_cultivo,
+            'cosechado_pct': (100.0 if model.campo.total_cultivo == 0 else
+                              100 * model.cosechado / model.campo.total_cultivo),
             'grano_entregado': model.entregado,
             'recargas_totales': int(sum(model.harvesters.recargas)
                                     + sum(model.tractores.recargas)),
@@ -173,9 +174,24 @@ async def _correr_simulacion(websocket, control, intervalo):
         # traiga `parametros`: es una visualizacion de la politica fija.
         p = dict(control.parametros, usar_qlearning_harvester=False,
                  usar_qlearning_tractor=False)
-        seed = p.get('seed') or 1
-        model = GranjaModel(p)
-        model.sim_setup(steps=p.get('steps'), seed=seed)
+        seed = p.get('seed')
+        if seed is None:
+            seed = 1
+        try:
+            model = GranjaModel(p)
+            model.sim_setup(steps=p.get('steps'), seed=seed)
+        except Exception as exc:
+            # parametros invalidos en un "reiniciar" (p.ej. pct_obstaculos
+            # fuera de rango, o un shape que no deja cultivo): se lo avisamos
+            # a Unity y nos quedamos esperando un "reiniciar" con parametros
+            # corregidos, en vez de tumbar toda la conexion.
+            print(f'No se pudo armar la simulacion con esos parametros: {exc}')
+            await websocket.send(json.dumps({'tipo': 'error', 'mensaje': str(exc)}))
+            control.reiniciar.clear()
+            await control.reiniciar.wait()
+            if control.cerrado:
+                break
+            continue
         await websocket.send(json.dumps(_construir_init(model, seed)))
 
         mascara_cosechado_previo = model.campo.terreno == COSECHADO
